@@ -4,100 +4,118 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
+	"time"
 )
 
+// store is the keeps track of all the existing and sold products.
 type store struct {
-	mtx               sync.RWMutex
-	name              string
-	supportedProducts map[ProductType]bool
-	productsInStock   map[productID]Product
-	processedOrders   map[orderID]*order
+	name            string
+	mtx             sync.RWMutex
+	products        map[productID]Product
+	processedOrders map[orderID]*order
 }
 
 // newStore creates a new store.
-func newStore(name string, supportedProducts ...ProductType) *store {
+func newStore(name string) *store {
 	store := &store{
-		name:              name,
-		productsInStock:   make(map[productID]Product),
-		supportedProducts: make(map[ProductType]bool),
-		processedOrders:   make(map[orderID]*order),
-	}
-
-	for _, productType := range supportedProducts {
-		store.supportedProducts[productType] = true
+		name:            name,
+		products:        make(map[productID]Product),
+		processedOrders: make(map[orderID]*order),
 	}
 
 	return store
 }
 
-// updateProduct adds a new product if it does not already exist or
-// updates an existing product.
-func (s *store) updateProduct(products ...Product) error {
+// addProducts adds new product(s) and returns an array of product IDs.
+func (s *store) addProducts(products ...Product) ([]productID, error) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
 	if len(products) == 0 {
-		return errors.New("provide one or more products")
+		return nil, errors.New("provide one or more products")
 	}
 
 	// Validate products.
 	for _, product := range products {
 		if product == nil {
-			return errors.New("invalid product")
+			return nil, errors.New("invalid product")
 		}
-		if supported, ok := s.supportedProducts[product.Type()]; !ok || !supported {
-			return fmt.Errorf("product with ID %s is not supported", product.ID().String())
-		}
-		if !product.Validate() {
-			return fmt.Errorf("product with ID %s is not valid or missing required fields", product.ID().String())
+
+		if !product.IsValid() {
+			return nil, fmt.Errorf("product with ID %s is not valid or missing required fields", product.ID().String())
 		}
 	}
 
-	for _, product := range products {
-		s.productsInStock[product.ID()] = product
+	now := time.Now()
+	productIDs := make([]productID, len(products))
+	for i, p := range products {
+		product := p.Product()
+
+		// Generate a new ID for this product.
+		s.generateProductID(product)
+
+		// Set essential product dates.
+		product.createdAt = &now
+		product.lastUpdated = &now
+
+		// Add product to store products map and also add the product ID to
+		// return to callers.
+		productID := p.ID()
+		s.products[productID] = p
+		productIDs[i] = productID
 	}
 
-	return nil
+	return productIDs, nil
 }
 
-// sellProduct sells one or more product to a buyer.
-func (s *store) sellProduct(order *order) error {
+// sellProduct sells one or more product to a buyer and returns the order ID.
+func (s *store) sellProduct(order *order) (orderID, error) {
+	if order == nil || order.shippingAddress == "" || order.amountPaid <= 0 || order.name == "" || len(order.products) == 0 {
+		return zeroOrderID, errors.New("order is missing required fields")
+	}
+
+	var totalProductCost float64
+	for _, p := range order.products {
+		if p == nil {
+			return zeroOrderID, errors.New("invalid product")
+		}
+
+		if _, ok := s.products[p.ID()]; !ok {
+			return zeroOrderID, fmt.Errorf("product with ID %s does not exist", p.ID().String())
+		}
+
+		if !p.IsValid() {
+			return zeroOrderID, fmt.Errorf("product with ID(%s) is not valid", p.ID())
+		}
+
+		totalProductCost += p.Price()
+	}
+
+	// Check if buyer paid enough.
+	if order.amountPaid < totalProductCost {
+		return zeroOrderID, fmt.Errorf("order amount paid is not enough, need %f but paid %f", totalProductCost, order.amountPaid)
+	}
+
 	s.mtx.Lock()
-	defer s.mtx.Unlock()
-
-	if order == nil || order.id.IsZero() || order.address == "" || order.amountPaid <= 0 || order.name == "" || len(order.products) == 0 {
-		return errors.New("order is missing required fields")
+	for _, p := range order.products {
+		delete(s.products, p.ID())
 	}
 
-	for _, product := range order.products {
-		if product == nil {
-			return errors.New("invalid product")
-		}
-		if supported, ok := s.supportedProducts[product.Type()]; !ok || !supported {
-			return fmt.Errorf("product with ID %s is not supported", product.ID().String())
-		}
-		if _, ok := s.productsInStock[product.ID()]; !ok {
-			return fmt.Errorf("product with ID %s does not exist", product.ID().String())
-		}
-		if !product.Validate() {
-			return fmt.Errorf("product is not valid, please select another") // this should not happen since we validate before we added to store.
-		}
-	}
-
-	for _, product := range order.products {
-		delete(s.productsInStock, product.ID())
-	}
-
+	// Generate new order ID.
+	s.generateOrderID(order)
 	s.processedOrders[order.id] = order
-	return nil
+	s.mtx.Unlock()
+
+	return order.id, nil
 }
 
 // product returns a single product if it is found.
 func (s *store) product(ID productID) Product {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	product, ok := s.productsInStock[ID]
+	product, ok := s.products[ID]
 	if !ok {
 		return nil
 	}
@@ -105,71 +123,62 @@ func (s *store) product(ID productID) Product {
 }
 
 // availableProducts returns the available products matching the provided
-// product type, and their total cost if they are in stock. If no
-// product type is specified, all the products in the store, and
-// their prices are returned.
-func (s *store) availableProducts(productType ProductType) ([]Product, float64, error) {
+// product type, and their total cost if they are in stock. If no product type
+// is specified, all the products in the store, and their prices are returned.
+func (s *store) availableProducts(productType string) ([]Product, float64) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	var products []Product
 	var totalCost float64
 
-	// If a product type is specified, validate it.
-	if productType != "" {
-		if supported, ok := s.supportedProducts[productType]; !ok || !supported {
-			return nil, 0, fmt.Errorf("product type %s is not supported", productType)
+	if productType == "" {
+		for _, product := range s.products {
+			products = append(products, product)
+			totalCost += product.Price()
 		}
+		return products, totalCost
+	}
 
-		for _, product := range s.productsInStock {
-			if product.Type() == productType {
-				products = append(products, product)
-				totalCost += product.Price()
-			}
-		}
-	} else {
-		for _, product := range s.productsInStock {
+	for _, product := range s.products {
+		if product.Type() == productType {
 			products = append(products, product)
 			totalCost += product.Price()
 		}
 	}
 
-	return products, totalCost, nil
+	return products, totalCost
 }
 
 // soldProducts returns the sold products matching the provided product type,
 // and their total cost. If no product type is specified, all the sold products
 // in the store, and their prices are returned.
-func (s *store) soldProducts(productType ProductType) ([]Product, float64, error) {
+func (s *store) soldProducts(productType string) ([]Product, float64) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+
 	var products []Product
 	var totalCost float64
 
-	// If not empty validate it.
-	if productType != "" {
-		// Ensure this product type is valid.
-		if _, ok := s.supportedProducts[productType]; !ok {
-			return nil, 0, fmt.Errorf("there's no product type %s", productType)
-		}
-
-		for _, orders := range s.processedOrders {
-			for _, product := range orders.products {
-				if product.Type() == productType {
-					products = append(products, product)
-					totalCost += product.Price()
-				}
-			}
-		}
-	} else {
+	if productType == "" {
 		for _, orders := range s.processedOrders {
 			for _, product := range orders.products {
 				products = append(products, product)
 				totalCost += product.Price()
 			}
 		}
+		return products, totalCost
 	}
 
-	return products, totalCost, nil
+	for _, orders := range s.processedOrders {
+		for _, product := range orders.products {
+			if product.Type() == productType {
+				products = append(products, product)
+				totalCost += product.Price()
+			}
+		}
+	}
+
+	return products, totalCost
 }
 
 // orders returns a list of processed orders.
@@ -187,36 +196,32 @@ func (s *store) orders() ([]*order, float64) {
 
 // deleteProducts removes one or more available product from the store and
 // return the number of products deleted. It will be a no-op if product does not
-// exist. In real life we should return an error.
+// exist.
 func (s *store) deleteProducts(productIDs ...productID) (int, error) {
 	if len(productIDs) == 0 {
 		return 0, errors.New("provide one or more product IDs")
 	}
 
 	s.mtx.Lock()
+	defer s.mtx.Unlock()
 	var deleted int
 	for _, productID := range productIDs {
-		if _, ok := s.productsInStock[productID]; ok {
-			delete(s.productsInStock, productID)
+		if _, ok := s.products[productID]; ok {
+			delete(s.products, productID)
 			deleted++
 		}
 	}
-	s.mtx.Unlock()
 
 	return deleted, nil
 }
 
 // inStock checks if the specified product type is in this store and
 // in stock.
-func (s *store) inStock(productType ProductType) bool {
+func (s *store) inStock(productType string) bool {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	// Validate product type and ensure there is support for it.
-	if supported, ok := s.supportedProducts[productType]; !ok || !supported {
-		return false
-	}
 
-	for _, product := range s.productsInStock {
+	for _, product := range s.products {
 		if product.Type() == productType {
 			return true
 		}
@@ -225,41 +230,18 @@ func (s *store) inStock(productType ProductType) bool {
 	return false
 }
 
-// updateProductsSupported adds or disables support for a product type.
-func (s *store) updateProductsSupported(productType ProductType, enable bool) error {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	_, ok := s.supportedProducts[productType]
-	if !enable && !ok {
-		return fmt.Errorf("cannot disable non-existent product type: %s", productType)
-	}
-
-	s.supportedProducts[productType] = enable
-	return nil
-}
-
-func (s *store) allSupportedProducts() map[ProductType]bool {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-	supportedProducts := make(map[ProductType]bool, 0)
-	for pType, supported := range s.supportedProducts {
-		supportedProducts[pType] = supported
-	}
-	return supportedProducts
-}
-
 // generateProductID generates a random ID for a product.
-func generateProductID(product *product) {
+func (s *store) generateProductID(product *product) {
 	_, err := rand.Read(product.id[:])
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 	}
 }
 
 // generateOrderID generates a random ID for an order.
-func generateOrderID(order *order) {
-	_, err := rand.Read(order.id[:])
+func (s *store) generateOrderID(product *order) {
+	_, err := rand.Read(product.id[:])
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 	}
 }
